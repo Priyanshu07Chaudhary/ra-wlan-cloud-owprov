@@ -236,21 +236,28 @@ namespace OpenWifi {
 		return true;
 	}
 
-	static bool FindExactExistingRole(ManagementRoleDB &DB, const std::string &userId, const std::string &entityId, const std::string &venueId, ProvObjects::ManagementRole &ExistingRole) {
-		std::vector<ProvObjects::ManagementRole> Roles;
-		if (AuthCache::GetInstance()->GetUserRoles(userId, Roles)) {
-			for (const auto &role : Roles) {
-				if (role.entity == entityId && role.venue == venueId) {
-					ExistingRole = role;
-					return true;
-				}
-			}
-			return false;
-		}
-
+	static bool FindExactExistingRole(ManagementRoleDB &DB, const std::string &userId, const std::string &entityId, const std::string &venueId, ProvObjects::ManagementRole &ExistingRole, Poco::Data::Session *S = nullptr) {
 		ManagementRoleDB::RecordVec DB_Roles;
 		std::string WhereClause = "entity='" + ORM::Escape(entityId) + "' and venue='" + ORM::Escape(venueId) + "' and users LIKE '%" + ORM::Escape(userId) + "%'";
-		if (DB.GetRecords(0, 100, DB_Roles, WhereClause)) {
+
+		bool success = false;
+		if (S != nullptr) {
+			success = DB.GetRecords(*S, 0, 100, DB_Roles, WhereClause);
+		} else {
+			std::vector<ProvObjects::ManagementRole> Roles;
+			if (AuthCache::GetInstance()->GetUserRoles(userId, Roles)) {
+				for (const auto &role : Roles) {
+					if (role.entity == entityId && role.venue == venueId) {
+						ExistingRole = role;
+						return true;
+					}
+				}
+				return false;
+			}
+			success = DB.GetRecords(0, 100, DB_Roles, WhereClause);
+		}
+
+		if (success) {
 			for (const auto &role : DB_Roles) {
 				for (const auto &user : role.users) {
 					if (user == userId) {
@@ -357,43 +364,46 @@ namespace OpenWifi {
 			return BadRequest(RESTAPI::Errors::MissingOrInvalidParameters, UserValidationError);
 		}
 
-		// TODO: Upgrade to native SQL transactions later (requires ORM update in orm.h to support session-bound transactions)
+		// Apply all role creations/updates atomically for the requested scope list.
+		// An uncommitted transaction is rolled back automatically on scope exit.
 		std::vector<ProvObjects::ManagementRole> SavedRoles;
-		std::vector<ProvObjects::ManagementRole> NewlyCreatedRoles;
 
-		bool BatchFailed = false;
-		for (std::size_t idx = 0; idx < Scopes.size(); ++idx) {
-			ProvObjects::ManagementRole RoleForScope = NewObject;
-			RoleForScope.venue = Scopes[idx];
-			if (idx > 0) {
-				RoleForScope.info.id = MicroServiceCreateUUID();
-			}
+		try {
+			auto tx = StorageService()->BeginTransaction();
 
-			ProvObjects::ManagementRole ExistingRole;
-			if (FindExactExistingRole(DB_, UserId, RoleForScope.entity, RoleForScope.venue, ExistingRole)) {
-				ExistingRole.managementPolicy = RoleForScope.managementPolicy;
-				ExistingRole.info.modified = Utils::Now();
-
-				if (!DB_.UpdateRecord("id", ExistingRole.info.id, ExistingRole)) {
-					BatchFailed = true;
-					break;
+			for (std::size_t idx = 0; idx < Scopes.size(); ++idx) {
+				ProvObjects::ManagementRole RoleForScope = NewObject;
+				RoleForScope.venue = Scopes[idx];
+				if (idx > 0) {
+					RoleForScope.info.id = MicroServiceCreateUUID();
 				}
-				SavedRoles.emplace_back(ExistingRole);
-				continue;
+
+				ProvObjects::ManagementRole ExistingRole;
+				if (FindExactExistingRole(DB_, UserId, RoleForScope.entity, RoleForScope.venue, ExistingRole, &tx.Session())) {
+					ExistingRole.managementPolicy = RoleForScope.managementPolicy;
+					ExistingRole.info.modified = Utils::Now();
+
+					if (!DB_.UpdateRecord(tx.Session(), "id", ExistingRole.info.id, ExistingRole)) {
+						Logger_.error("MANAGEMENT_ROLE: Failed to update role record for id '" + ExistingRole.info.id + "'. Transaction will rollback on scope exit.");
+						return InternalError(RESTAPI::Errors::RecordNotCreated);
+					}
+					SavedRoles.emplace_back(ExistingRole);
+					continue;
+				}
+
+				if (!DB_.CreateRecord(tx.Session(), RoleForScope)) {
+					Logger_.error("MANAGEMENT_ROLE: Failed to create role record for id '" + RoleForScope.info.id + "'. Transaction will rollback on scope exit.");
+					return InternalError(RESTAPI::Errors::RecordNotCreated);
+				}
+				SavedRoles.emplace_back(RoleForScope);
 			}
 
-			if (!DB_.CreateRecord(RoleForScope)) {
-				BatchFailed = true;
-				break;
+			if (!tx.Commit()) {
+				Logger_.error("MANAGEMENT_ROLE: Failed to commit DB transaction. Rollback will be attempted on scope exit.");
+				return InternalError(RESTAPI::Errors::RecordNotCreated);
 			}
-			NewlyCreatedRoles.emplace_back(RoleForScope);
-			SavedRoles.emplace_back(RoleForScope);
-		}
-
-		if (BatchFailed) {
-			for (const auto &role : NewlyCreatedRoles) {
-				DB_.DeleteRecord("id", role.info.id);
-			}
+		} catch (const Poco::Exception &E) {
+			Logger_.error("MANAGEMENT_ROLE: Database transaction failed: " + E.displayText());
 			return InternalError(RESTAPI::Errors::RecordNotCreated);
 		}
 
