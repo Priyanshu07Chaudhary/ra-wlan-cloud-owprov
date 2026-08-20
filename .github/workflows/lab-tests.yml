@@ -296,6 +296,115 @@ jobs:
         run: go run main.go
         working-directory: ${{ github.workspace }}/tests/lab_tests
 
+      # ── Execute PostgreSQL DB Transaction Rollback Phase ─────────────────────
+      - name: Stop SQLite owprov container
+        run: docker rm -f owprov
+
+      - name: Start PostgreSQL Container
+        run: |
+          set -euo pipefail
+
+          docker run -d \
+            --name postgres \
+            --network host \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=owprov \
+            postgres:15-alpine
+
+          echo "Waiting for PostgreSQL to be ready..."
+          ready=false
+          for i in {1..30}; do
+            if docker exec postgres pg_isready -U postgres -d owprov > /dev/null 2>&1; then
+              echo "PostgreSQL is ready!"
+              ready=true
+              break
+            fi
+            echo "attempt $i/30..."
+            sleep 1
+          done
+
+          if [ "$ready" != "true" ]; then
+            echo "ERROR: PostgreSQL did not become ready!"
+            docker logs postgres
+            exit 1
+          fi
+
+      - name: Start owprov in PostgreSQL mode
+        run: |
+          set -euo pipefail
+
+          docker run -d \
+            --name owprov \
+            --network host \
+            -v /tmp/owprov-data/certs:/owprov-data/certs:ro \
+            -v /tmp/owprov-data/certs/restapi-ca.pem:/usr/local/share/ca-certificates/restapi-ca-selfsigned.crt:ro \
+            -v /tmp/owprov-data/data:/owprov-data/data \
+            -e SELFSIGNED_CERTS=true \
+            -e TEMPLATE_CONFIG=true \
+            -e KAFKA_ENABLE=true \
+            -e KAFKA_BROKERLIST=localhost:9092 \
+            -e STORAGE_TYPE=postgresql \
+            -e STORAGE_TYPE_POSTGRESQL_HOST=localhost \
+            -e STORAGE_TYPE_POSTGRESQL_PORT=5432 \
+            -e STORAGE_TYPE_POSTGRESQL_USERNAME=postgres \
+            -e STORAGE_TYPE_POSTGRESQL_PASSWORD=postgres \
+            -e STORAGE_TYPE_POSTGRESQL_DATABASE=owprov \
+            -e RESTAPI_HOST_PORT=16005 \
+            -e INTERNAL_RESTAPI_HOST_PORT=17005 \
+            owprov:test
+
+          echo "Waiting for PostgreSQL-backed owprov to start on port 16005..."
+          for i in {1..40}; do
+            if curl -k -s --max-time 3 \
+              "https://localhost:16005/api/v1/system?command=info" \
+              > /dev/null 2>&1; then
+              echo "PostgreSQL-backed owprov is UP!"
+              exit 0
+            fi
+
+            if ! docker inspect -f '{{.State.Running}}' owprov 2>/dev/null | grep -q true; then
+              echo "ERROR: owprov container exited!"
+              docker logs owprov
+              exit 1
+            fi
+
+            echo "attempt $i/40..."
+            sleep 3
+          done
+
+          echo "ERROR: owprov did not start in time!"
+          docker logs owprov
+          exit 1
+
+      # ── Publish Kafka join events for PostgreSQL owprov ─────────────────────
+      - name: Re-publish owsec + owfms Kafka join events for PostgreSQL owprov
+        run: |
+          set -euo pipefail
+
+          echo '{"event":"join","id":16001,"type":"owsec","publicEndPoint":"https://localhost:16001","privateEndPoint":"https://localhost:16001","key":"testkey","version":"2.1.0"}' | \
+            docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh \
+            --bootstrap-server localhost:9092 \
+            --topic service_events
+
+          echo '{"event":"join","id":16004,"type":"owfms","publicEndPoint":"https://localhost:16004","privateEndPoint":"https://localhost:16004","key":"testkey","version":"2.1.0"}' | \
+            docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh \
+            --bootstrap-server localhost:9092 \
+            --topic service_events
+
+          echo "Waiting for owprov to consume service join events..."
+          sleep 10
+
+          echo "Checking owprov logs for Kafka registration problems..."
+          docker logs owprov 2>&1 | tail -50
+
+      - name: Execute DB Transaction Rollback Test
+        env:
+          OWPROV_URL: "https://localhost:16005/api/v1"
+          OWPROV_TEST_DATABASE_URL: "postgres://postgres:postgres@localhost:5432/owprov?sslmode=disable"
+        run: go test -v . -run '^TestManagementRole_MultiScopeTransactionRollback$' -count=1
+        working-directory: ${{ github.workspace }}/tests/rbac_tests
+
       # ── Upload results ────────────────────────────────────────────────────────
       - name: Upload Test Result Artifacts
         if: always()
