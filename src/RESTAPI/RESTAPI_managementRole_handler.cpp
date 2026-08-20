@@ -383,7 +383,7 @@ namespace OpenWifi {
 					ExistingRole.managementPolicy = RoleForScope.managementPolicy;
 					ExistingRole.info.modified = Utils::Now();
 
-					if (!DB_.UpdateRecord(tx.Session(), "id", ExistingRole.info.id, ExistingRole)) {
+					if (!DB_.UpdateRecord(tx, "id", ExistingRole.info.id, ExistingRole)) {
 						Logger_.error("MANAGEMENT_ROLE: Failed to update role record for id '" + ExistingRole.info.id + "'. Transaction will rollback on scope exit.");
 						return InternalError(RESTAPI::Errors::RecordNotCreated);
 					}
@@ -391,7 +391,7 @@ namespace OpenWifi {
 					continue;
 				}
 
-				if (!DB_.CreateRecord(tx.Session(), RoleForScope)) {
+				if (!DB_.CreateRecord(tx, RoleForScope)) {
 					Logger_.error("MANAGEMENT_ROLE: Failed to create role record for id '" + RoleForScope.info.id + "'. Transaction will rollback on scope exit.");
 					return InternalError(RESTAPI::Errors::RecordNotCreated);
 				}
